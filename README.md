@@ -49,5 +49,5 @@ TCP 缓冲区、BBR、fastopen 只影响**路由器本机**的 TCP 连接（代�
 
 ## 测试过的系统
 
-- ImmortalWrt 25.12.2（内核 6.12，apk），MT7981 / MT7987A，1 GB
-- ImmortalWrt 24.10 第三方固件（内核 6.6，opkg，无 sch_fq），MT7981，1 GB
+- ImmortalWrt 25.12.2（内核 6.12，apk），mediatek/filogic，1 GB
+- ImmortalWrt 24.10 第三方固件（内核 6.6，opkg，无 sch_fq），mediatek/filogic，1 GB
