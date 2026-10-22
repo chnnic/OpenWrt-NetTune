@@ -3,12 +3,15 @@
 # 用法：
 #   sh nettune.sh            应用（可重复执行）
 #   sh nettune.sh status     只查看当前值，不改动
-#   sh nettune.sh uninstall  卸载并恢复原来的 /etc/sysctl.conf
+#   sh nettune.sh x86        可选：多核分流（数据包引导 + irqbalance + 网卡多队列），x86 软路由/虚拟机用
+#   sh nettune.sh uninstall  卸载并恢复原来的 /etc/sysctl.conf（x86 步骤也一并撤销）
 # 说明：TCP 缓冲区/BBR 只影响路由器本机的 TCP（代理、frpc、iperf3、容器）；backlog 和 conntrack 影响转发。
 
 CONF=/etc/sysctl.d/95-tune.conf
 BAK=/etc/sysctl.conf.nettune.bak
 KEEP=/etc/sysupgrade.conf
+STATE=/etc/nettune.state
+QHOOK=/etc/hotplug.d/net/50-nettune-queues
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  [OK]   %s\n' "$*"; }
@@ -151,6 +154,7 @@ show_status() {
 	done
 	say "  可用拥塞算法: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
 	[ -f "$CONF" ] && say "  已安装: $CONF" || say "  未安装"
+	show_x86
 }
 
 do_apply() {
@@ -192,7 +196,163 @@ do_apply() {
 	say "完成。可重复执行；卸载：sh $0 uninstall"
 }
 
+ncpu() { grep -c '^processor' /proc/cpuinfo; }
+
+# 物理网卡：有 device、不是无线、不是 VLAN/bond 之类的上层设备
+phys_nics() {
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		[ -e "$d/device" ] || continue
+		[ -e "$d/phy80211" ] && continue
+		ls "$d"/lower_* >/dev/null 2>&1 && continue
+		echo "$n"
+	done
+}
+
+nic_driver() { basename "$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null)"; }
+
+# 网卡多队列钩子：网卡出现（开机、热插拔、驱动重载）时把 combined 队列数设为 min(网卡上限, CPU 核数)
+write_qhook() {
+	mkdir -p "${QHOOK%/*}"
+	cat > "$QHOOK" <<'EOF'
+# 由 nettune.sh x86 生成：网卡多队列
+[ "$ACTION" = add ] || exit 0
+[ -e "/sys/class/net/$INTERFACE/device" ] || exit 0
+[ -e "/sys/class/net/$INTERFACE/phy80211" ] && exit 0
+command -v ethtool >/dev/null 2>&1 || exit 0
+eval "$(ethtool -l "$INTERFACE" 2>/dev/null | awk '/[Mm]aximums/{s="max"} /[Cc]urrent/{s="cur"} /^Combined:/ && $2 ~ /^[0-9]+$/{print s"="$2}')"
+[ -n "$max" ] && [ -n "$cur" ] && [ "$max" -gt 1 ] 2>/dev/null || exit 0
+n=$(grep -c '^processor' /proc/cpuinfo)
+want=$max; [ "$n" -lt "$want" ] && want=$n
+[ "$cur" -eq "$want" ] || ethtool -L "$INTERFACE" combined "$want" 2>/dev/null
+exit 0
+EOF
+}
+
+state_get() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE"; }
+state_set() { [ -n "$(state_get "$1")" ] || echo "$1=$2" >> "$STATE"; }
+
+do_x86() {
+	say "== 多核分流（可选步骤）"
+	case "$(uname -m)" in
+		x86_64|i?86) ;;
+		*) if [ "$FORCE" != 1 ]; then
+			say "  本机是 $(uname -m)，不是 x86。ARM 路由器开了硬件加速（flow offload/WED）时，数据包引导可能反而变慢。"
+			say "  确定要用：FORCE=1 sh $0 x86"
+			return 1
+		   fi ;;
+	esac
+	n=$(ncpu)
+	ok "CPU $n 核"
+	[ "$n" -gt 1 ] || { warn "单核，不需要多核分流"; return 0; }
+
+	# 1) 数据包引导：OpenWrt 23.05+ 的 packet_steering。用 2（全部 CPU）：
+	#    1 会把一张网卡所有接收队列的 RPS 都指到同一个核，多队列网卡反而被收窄成单核
+	if uci -q get network.@globals[0] >/dev/null; then
+		state_set packet_steering "$(uci -q get network.@globals[0].packet_steering || echo none)"
+		uci set network.@globals[0].packet_steering=2
+		uci commit network
+		if [ -x /etc/init.d/packet_steering ]; then
+			/etc/init.d/packet_steering enable >/dev/null 2>&1
+			/etc/init.d/packet_steering reload >/dev/null 2>&1
+			ok "数据包引导已开启（packet_steering=2，分到全部 CPU）"
+		elif [ -x /usr/libexec/network/packet-steering.sh ]; then
+			/usr/libexec/network/packet-steering.sh 2 >/dev/null 2>&1
+			ok "数据包引导已开启（旧版脚本）"
+		else
+			ok "已设置 packet_steering=2，重启网络后生效"
+		fi
+	else
+		warn "没有 network.globals，跳过数据包引导"
+	fi
+
+	# 2) irqbalance：把网卡硬中断分到多个核（和数据包引导互补：后者只管软件分流）
+	if ! command -v irqbalance >/dev/null 2>&1; then
+		say "  安装 irqbalance ..."
+		pkg_install irqbalance && state_set irqbalance_pkg installed
+	fi
+	if command -v irqbalance >/dev/null 2>&1 && [ -x /etc/init.d/irqbalance ]; then
+		uci -q get irqbalance.@irqbalance[0] >/dev/null || uci add irqbalance irqbalance >/dev/null
+		state_set irqbalance_enabled "$(uci -q get irqbalance.@irqbalance[0].enabled || echo 0)"
+		uci set irqbalance.@irqbalance[0].enabled=1
+		uci commit irqbalance
+		/etc/init.d/irqbalance enable >/dev/null 2>&1
+		/etc/init.d/irqbalance restart >/dev/null 2>&1
+		sleep 1
+		if pgrep irqbalance >/dev/null 2>&1; then ok "irqbalance 已运行"; else err "irqbalance 没有起来，看 logread"; fi
+	else
+		warn "irqbalance 装不上，跳过"
+	fi
+
+	# 3) 网卡多队列
+	if ! command -v ethtool >/dev/null 2>&1; then
+		say "  安装 ethtool ..."
+		pkg_install ethtool || pkg_install ethtool-full
+	fi
+	if command -v ethtool >/dev/null 2>&1; then
+		write_qhook
+		[ -f "$KEEP" ] && { grep -qx "$QHOOK" "$KEEP" || echo "$QHOOK" >> "$KEEP"; }
+		say "  调整网卡队列（部分网卡会断开一两秒）..."
+		for nic in $(phys_nics); do
+			ACTION=add INTERFACE=$nic sh "$QHOOK"
+			eval "$(ethtool -l "$nic" 2>/dev/null | awk '/[Mm]aximums/{s="max"} /[Cc]urrent/{s="cur"} /^Combined:/ && $2 ~ /^[0-9]+$/{print s"="$2}')"
+			drv=$(nic_driver "$nic")
+			if [ -z "$max" ]; then
+				warn "$nic（$drv）不支持查询队列"
+			elif [ "$max" -le 1 ]; then
+				warn "$nic（$drv）只有 1 个队列"
+				[ "$drv" = virtio_net ] && say "         虚拟机网卡：在 PVE 网卡设置里把「Multiqueue」设成 CPU 核数后重启虚拟机"
+			else
+				ok "$nic（$drv）队列 $cur / 上限 $max"
+			fi
+			case "$drv" in
+				igc) say "         Intel i225/i226：如遇断流，可试 ethtool --set-eee $nic eee off" ;;
+				e1000|e1000e|8139cp) say "         $drv 是模拟/老网卡，虚拟机建议换 virtio" ;;
+			esac
+			max=; cur=
+		done
+	else
+		warn "ethtool 装不上，跳过网卡多队列"
+	fi
+	say "完成。撤销：sh $0 uninstall"
+}
+
+undo_x86() {
+	[ -f "$STATE" ] || return 0
+	ps=$(state_get packet_steering)
+	if [ -n "$ps" ]; then
+		if [ "$ps" = none ]; then uci -q delete network.@globals[0].packet_steering; else uci set network.@globals[0].packet_steering="$ps"; fi
+		uci commit network
+		[ -x /etc/init.d/packet_steering ] && /etc/init.d/packet_steering reload >/dev/null 2>&1
+		ok "数据包引导已恢复"
+	fi
+	ie=$(state_get irqbalance_enabled)
+	if [ -n "$ie" ] && [ -x /etc/init.d/irqbalance ]; then
+		uci set irqbalance.@irqbalance[0].enabled="$ie"
+		uci commit irqbalance
+		if [ "$ie" = 0 ]; then /etc/init.d/irqbalance stop >/dev/null 2>&1; /etc/init.d/irqbalance disable >/dev/null 2>&1; fi
+		ok "irqbalance 已恢复"
+	fi
+	rm -f "$QHOOK" "$STATE"
+	[ -f "$KEEP" ] && sed -i "\|^$QHOOK\$|d" "$KEEP"
+	ok "网卡队列钩子已删除（队列数重启后恢复驱动默认）"
+}
+
+show_x86() {
+	say "  数据包引导: packet_steering=$(uci -q get network.@globals[0].packet_steering || echo 未设置)"
+	if command -v irqbalance >/dev/null 2>&1; then
+		say "  irqbalance: enabled=$(uci -q get irqbalance.@irqbalance[0].enabled || echo ?) $(pgrep irqbalance >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
+	fi
+	command -v ethtool >/dev/null 2>&1 || return 0
+	for nic in $(phys_nics); do
+		eval "$(ethtool -l "$nic" 2>/dev/null | awk '/[Mm]aximums/{s="max"} /[Cc]urrent/{s="cur"} /^Combined:/ && $2 ~ /^[0-9]+$/{print s"="$2}')"
+		[ -n "$max" ] && say "  网卡 $nic（$(nic_driver "$nic")）队列 $cur / 上限 $max"
+		max=; cur=
+	done
+}
+
 do_uninstall() {
+	undo_x86
 	rm -f "$CONF"
 	[ -f "$KEEP" ] && sed -i "\|^$CONF\$|d" "$KEEP"
 	if [ -f "$BAK" ]; then mv "$BAK" /etc/sysctl.conf; ok "已恢复 /etc/sysctl.conf"; fi
@@ -204,5 +364,6 @@ case "$1" in
 	status)    show_status ;;
 	uninstall) do_uninstall ;;
 	''|apply)  do_apply ;;
-	*) say "用法: sh $0 [apply|status|uninstall]"; exit 1 ;;
+	x86)       do_x86 ;;
+	*) say "用法: sh $0 [apply|status|x86|uninstall]"; exit 1 ;;
 esac
